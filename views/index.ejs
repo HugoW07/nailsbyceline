@@ -951,6 +951,7 @@
     // Enhanced Image loading with SEO optimizations
     class SEOImageHandler {
       constructor() {
+        this.loadedImages = new Set();
         this.init();
       }
 
@@ -966,24 +967,34 @@
         const placeholders = document.querySelectorAll(".image-placeholder[data-image-key]");
         console.log(`Found ${placeholders.length} image placeholders`);
 
-        placeholders.forEach((placeholder) => {
+        placeholders.forEach((placeholder, index) => {
           const key = placeholder.getAttribute("data-image-key");
-          console.log(`Processing image key: ${key}`);
+          console.log(`[${index}] Processing image key: ${key}`);
 
           if (SEO_IMAGE_PATHS[key]) {
             const imagePath = SEO_IMAGE_PATHS[key];
-            console.log(`Assigned path for ${key}: ${imagePath}`);
+            console.log(`[${index}] Assigned path for ${key}: ${imagePath}`);
             placeholder.setAttribute("data-image", imagePath);
-            this.loadImageWithSEO(placeholder);
+
+            // Add slight delay between image loads to prevent race conditions
+            setTimeout(() => {
+              this.loadImageWithSEO(placeholder, key);
+            }, index * 100);
           } else {
             console.warn(`No image path found for key: ${key}`);
           }
         });
       }
 
-      loadImageWithSEO(placeholder) {
+      loadImageWithSEO(placeholder, key) {
         const imagePath = placeholder.getAttribute("data-image");
         const altText = placeholder.getAttribute("data-alt") || "Professional nail service image";
+
+        // Prevent duplicate loads
+        if (this.loadedImages.has(key)) {
+          console.log(`Image ${key} already loaded, skipping`);
+          return;
+        }
 
         const img = new Image();
         const originalContent = placeholder.innerHTML;
@@ -992,13 +1003,17 @@
         img.loading = "lazy";
 
         img.onload = () => {
+          console.log(`✓ Image loaded successfully: ${key}`);
+          this.loadedImages.add(key);
           this.showImageWithSEO(placeholder, img, altText);
         };
 
-        img.onerror = () => {
-          this.showFallback(placeholder, originalContent);
+        img.onerror = (error) => {
+          console.error(`✗ Failed to load image: ${key} at path: ${imagePath}`, error);
+          this.showFallback(placeholder, originalContent, imagePath);
         };
 
+        console.log(`Attempting to load: ${imagePath}`);
         img.src = imagePath;
         img.alt = altText;
       }
