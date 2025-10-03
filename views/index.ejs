@@ -951,15 +951,20 @@
     // Enhanced Image loading with SEO optimizations
     class SEOImageHandler {
       constructor() {
-        this.loadedImages = new Set();
+        this.loadQueue = [];
+        this.isProcessing = false;
+        this.retryAttempts = new Map();
+        this.maxRetries = 3;
         this.init();
       }
 
       init() {
+        // Wait for DOM to be fully ready
         if (document.readyState === "loading") {
           document.addEventListener("DOMContentLoaded", () => this.setupImages());
         } else {
-          this.setupImages();
+          // Add a small delay to ensure all elements are rendered
+          setTimeout(() => this.setupImages(), 100);
         }
       }
 
@@ -967,179 +972,409 @@
         const placeholders = document.querySelectorAll(".image-placeholder[data-image-key]");
         console.log(`Found ${placeholders.length} image placeholders`);
 
+        // Clear any existing queue
+        this.loadQueue = [];
+
         placeholders.forEach((placeholder, index) => {
           const key = placeholder.getAttribute("data-image-key");
-          console.log(`[${index}] Processing image key: ${key}`);
 
           if (SEO_IMAGE_PATHS[key]) {
             const imagePath = SEO_IMAGE_PATHS[key];
-            console.log(`[${index}] Assigned path for ${key}: ${imagePath}`);
             placeholder.setAttribute("data-image", imagePath);
 
-            // Add slight delay between image loads to prevent race conditions
-            setTimeout(() => {
-              this.loadImageWithSEO(placeholder, key);
-            }, index * 100);
+            // Mark each placeholder with a unique identifier
+            placeholder.setAttribute("data-placeholder-id", `placeholder-${index}`);
+
+            // Add to queue for loading
+            this.loadQueue.push({
+              placeholder,
+              key,
+              imagePath,
+              placeholderId: `placeholder-${index}`
+            });
+
+            console.log(`Queued image ${index}: ${key} -> ${imagePath}`);
           } else {
             console.warn(`No image path found for key: ${key}`);
+            this.enhancePlaceholder(placeholder);
           }
         });
+
+        console.log(`Total images queued: ${this.loadQueue.length}`);
+
+        // Start processing the queue
+        this.processQueue();
       }
 
-      loadImageWithSEO(placeholder, key) {
-        const imagePath = placeholder.getAttribute("data-image");
-        const altText = placeholder.getAttribute("data-alt") || "Professional nail service image";
-
-        // Prevent duplicate loads
-        if (this.loadedImages.has(key)) {
-          console.log(`Image ${key} already loaded, skipping`);
+      async processQueue() {
+        if (this.isProcessing || this.loadQueue.length === 0) {
+          console.log("Queue processing complete or already in progress");
           return;
         }
 
-        const img = new Image();
-        const originalContent = placeholder.innerHTML;
+        this.isProcessing = true;
+        console.log(`Starting to process ${this.loadQueue.length} images`);
 
-        placeholder.classList.add("loading");
-        img.loading = "lazy";
+        // Process in batches for better performance
+        const batchSize = 3;
+        let batchNumber = 0;
 
-        img.onload = () => {
-          console.log(`✓ Image loaded successfully: ${key}`);
-          this.loadedImages.add(key);
-          this.showImageWithSEO(placeholder, img, altText);
-        };
+        while (this.loadQueue.length > 0) {
+          batchNumber++;
+          const batch = this.loadQueue.splice(0, batchSize);
+          console.log(`Processing batch ${batchNumber} with ${batch.length} images`);
 
-        img.onerror = (error) => {
-          console.error(`✗ Failed to load image: ${key} at path: ${imagePath}`, error);
-          this.showFallback(placeholder, originalContent, imagePath);
-        };
+          // Load batch in parallel
+          const promises = batch.map(item => this.loadImageWithSEO(item));
+          const results = await Promise.allSettled(promises);
 
-        console.log(`Attempting to load: ${imagePath}`);
-        img.src = imagePath;
-        img.alt = altText;
+          // Log batch results
+          results.forEach((result, index) => {
+            if (result.status === 'fulfilled') {
+              console.log(`Batch ${batchNumber}, Image ${index + 1}: Success`);
+            } else {
+              console.log(`Batch ${batchNumber}, Image ${index + 1}: Failed - ${result.reason}`);
+            }
+          });
+
+          // Small delay between batches to prevent overwhelming the browser
+          if (this.loadQueue.length > 0) {
+            await new Promise(resolve => setTimeout(resolve, 50));
+          }
+        }
+
+        this.isProcessing = false;
+        console.log("All images processed");
       }
 
-      showImageWithSEO(placeholder, img, altText) {
-        placeholder.classList.remove("loading");
+      loadImageWithSEO({ placeholder, key, imagePath, placeholderId }) {
+        return new Promise((resolve, reject) => {
+          console.log(`Loading image for ${key} (${placeholderId})`);
 
+          const altText = placeholder.getAttribute("data-alt") || "Professional nail service image";
+
+          // Check if this specific placeholder already has a loaded image
+          const existingImg = placeholder.querySelector("img.loaded");
+          if (existingImg && existingImg.complete && existingImg.naturalWidth > 0) {
+            console.log(`Image ${key} already successfully loaded in ${placeholderId}`);
+            resolve();
+            return;
+          }
+
+          // Remove any previous failed attempts for this specific placeholder
+          const existingContainer = placeholder.querySelector(".image-container");
+          if (existingContainer) {
+            console.log(`Removing existing container from ${placeholderId}`);
+            existingContainer.remove();
+          }
+
+          // Create a new image element
+          const img = new Image();
+
+          // Add loading state to this specific placeholder
+          placeholder.classList.add("loading");
+
+          // Set up load handler
+          img.onload = () => {
+            console.log(`✓ Image loaded successfully: ${key} for ${placeholderId}`);
+            this.retryAttempts.delete(`${key}-${placeholderId}`);
+
+            // Ensure we're still working with the right placeholder
+            if (placeholder && placeholder.isConnected) {
+              this.showImageWithSEO(placeholder, img, altText, key, placeholderId);
+              placeholder.classList.remove("loading");
+              resolve();
+            } else {
+              console.error(`Placeholder ${placeholderId} no longer in DOM`);
+              reject(new Error("Placeholder removed from DOM"));
+            }
+          };
+
+          // Set up error handler
+          img.onerror = () => {
+            const attemptKey = `${key}-${placeholderId}`;
+            const attempts = (this.retryAttempts.get(attemptKey) || 0) + 1;
+            this.retryAttempts.set(attemptKey, attempts);
+
+            console.error(`✗ Failed to load image: ${key} for ${placeholderId} (attempt ${attempts}/${this.maxRetries})`);
+
+            placeholder.classList.remove("loading");
+
+            if (attempts < this.maxRetries) {
+              // Retry with exponential backoff
+              console.log(`Scheduling retry for ${key} in ${attempts * 1000}ms`);
+              setTimeout(() => {
+                this.loadQueue.push({ placeholder, key, imagePath, placeholderId });
+                this.processQueue();
+              }, attempts * 1000);
+            } else {
+              console.log(`Max retries reached for ${key}, showing fallback`);
+              this.showFallback(placeholder, key);
+            }
+
+            resolve(); // Resolve even on error to continue processing other images
+          };
+
+          // Add timeout to prevent hanging
+          const timeoutId = setTimeout(() => {
+            console.log(`Timeout loading ${key} for ${placeholderId}`);
+            img.onerror();
+          }, 10000); // 10 second timeout
+
+          img.addEventListener("load", () => clearTimeout(timeoutId));
+          img.addEventListener("error", () => clearTimeout(timeoutId));
+
+          // Set image properties and initiate load
+          img.alt = altText;
+          img.loading = "lazy";
+
+          console.log(`Starting load: ${imagePath} for ${placeholderId}`);
+          img.src = imagePath;
+        });
+      }
+
+      showImageWithSEO(placeholder, img, altText, key, placeholderId) {
+        console.log(`Displaying image ${key} in ${placeholderId}`);
+
+        // Hide original placeholder content
+        const originalContent = placeholder.querySelector("div:not(.image-container)");
+        if (originalContent) {
+          originalContent.style.display = "none";
+        }
+
+        // Create a new image container for this specific placeholder
         const imageContainer = document.createElement("div");
-        imageContainer.className = "absolute inset-0 w-full h-full";
+        imageContainer.className = "image-container absolute inset-0 w-full h-full";
+        imageContainer.setAttribute("data-container-for", placeholderId);
 
+        // Ensure placeholder has relative positioning
+        placeholder.style.position = "relative";
+        placeholder.style.overflow = "hidden";
+
+        // Create the actual image element
         const imageElement = document.createElement("img");
         imageElement.src = img.src;
         imageElement.alt = altText;
-        imageElement.className = "w-full h-full object-cover rounded-inherit";
+        imageElement.className = "w-full h-full object-cover rounded-inherit loaded";
         imageElement.loading = "lazy";
-        imageElement.style.opacity = "0";
-        imageElement.style.transition = "opacity 0.3s ease-in-out";
+        imageElement.setAttribute("data-image-key", key);
+        imageElement.setAttribute("data-loaded-in", placeholderId);
 
+        // Start with opacity 0 for smooth fade-in
+        imageElement.style.cssText = "opacity: 0; transition: opacity 0.5s ease-in-out;";
+
+        // Add image to container
         imageContainer.appendChild(imageElement);
-        placeholder.style.position = "relative";
+
+        // Add container to placeholder
         placeholder.appendChild(imageContainer);
 
-        setTimeout(() => {
-          imageElement.style.opacity = "1";
-          imageElement.classList.add("loaded");
-        }, 50);
+        // Force a reflow to ensure the opacity transition works
+        void imageElement.offsetHeight;
 
-        this.addSEOOverlay(placeholder, imageContainer, altText);
+        // Fade in the image
+        requestAnimationFrame(() => {
+          imageElement.style.opacity = "1";
+          console.log(`Image ${key} faded in for ${placeholderId}`);
+        });
+
+        // Add hover overlay after image is visible
+        setTimeout(() => {
+          this.addSEOOverlay(placeholder, imageContainer, altText);
+        }, 100);
+
+        // Remove error class if present
+        placeholder.classList.remove("image-error", "loading");
+
+        // Mark as successfully loaded
+        placeholder.setAttribute("data-image-loaded", "true");
       }
 
       addSEOOverlay(placeholder, imageContainer, altText) {
-        placeholder.addEventListener("mouseenter", () => {
-          const overlay = document.createElement("div");
-          overlay.className = "absolute inset-0 bg-black bg-opacity-50 flex items-center justify-center text-white text-sm opacity-0 transition-opacity duration-300 rounded-inherit";
-          overlay.innerHTML = `<div class="text-center p-2"><i class="fas fa-eye text-xl mb-2"></i><br>${altText}</div>`;
+        let overlay = null;
 
-          imageContainer.appendChild(overlay);
+        const showOverlay = (e) => {
+          // Only show overlay on direct hover, not bubbled events
+          if (e.target !== placeholder && !placeholder.contains(e.target)) return;
 
-          setTimeout(() => {
-            overlay.style.opacity = "1";
-          }, 10);
-        });
+          if (!overlay && imageContainer.isConnected) {
+            overlay = document.createElement("div");
+            overlay.className = "image-overlay absolute inset-0 bg-black bg-opacity-50 flex items-center justify-center text-white text-xs p-2 opacity-0 transition-opacity duration-300 rounded-inherit pointer-events-none";
+            overlay.innerHTML = `<div class="text-center"><i class="fas fa-eye text-lg mb-1"></i><br>${altText.substring(0, 50)}${altText.length > 50 ? '...' : ''}</div>`;
+            imageContainer.appendChild(overlay);
 
-        placeholder.addEventListener("mouseleave", () => {
-          const overlay = imageContainer.querySelector(".bg-black");
-          if (overlay) {
-            overlay.remove();
+            requestAnimationFrame(() => {
+              if (overlay) overlay.style.opacity = "1";
+            });
           }
-        });
+        };
+
+        const hideOverlay = () => {
+          if (overlay && overlay.isConnected) {
+            overlay.style.opacity = "0";
+            setTimeout(() => {
+              if (overlay && overlay.isConnected) {
+                overlay.remove();
+                overlay = null;
+              }
+            }, 300);
+          }
+        };
+
+        // Clean up any existing listeners
+        placeholder.removeEventListener("mouseenter", showOverlay);
+        placeholder.removeEventListener("mouseleave", hideOverlay);
+
+        // Add new listeners
+        placeholder.addEventListener("mouseenter", showOverlay);
+        placeholder.addEventListener("mouseleave", hideOverlay);
       }
 
-      showFallback(placeholder, originalContent) {
-        placeholder.classList.remove("loading");
-        placeholder.innerHTML = originalContent;
+      showFallback(placeholder, key) {
+        console.log(`Showing fallback for ${key}`);
+
         placeholder.classList.add("image-error");
+        placeholder.classList.remove("loading");
+
+        // Show the original placeholder content
+        const originalContent = placeholder.querySelector("div:not(.image-container)");
+        if (originalContent) {
+          originalContent.style.display = "flex";
+
+          // Update the placeholder to show it's a fallback
+          const icon = originalContent.querySelector("i");
+          if (icon) {
+            icon.className = "fas fa-exclamation-circle text-2xl mb-2 text-gray-400";
+          }
+
+          const text = originalContent.querySelector("p");
+          if (text) {
+            text.innerHTML = `Image unavailable<br/><small>${key}</small>`;
+          }
+        }
+
+        placeholder.setAttribute("data-image-loaded", "false");
+      }
+
+      enhancePlaceholder(placeholder) {
+        placeholder.style.animation = "pulse 2s cubic-bezier(0.4, 0, 0.6, 1) infinite";
       }
     }
 
     // SEO-optimized image paths
     const SEO_IMAGE_PATHS = {
-      hero1: "/images/professional-nail-art-showcase-vaxjo.jpg",
-      hero2: "/images/manicure-process-nailsbyceline.jpg",
-      hero3: "/images/modern-nail-salon-interior-vaxjo.jpg",
-      hero4: "/images/satisfied-client-beautiful-nails.jpg",
-      featured1: "/images/elegant-french-manicure-gold-accents.jpg",
-      featured2: "/images/colorful-geometric-nail-art-design.jpg",
-      featured3: "/images/acrylic-extensions-ombre-design.jpg",
-      gallery1: "/images/professional-gel-manicure-vaxjo.jpg",
-      gallery2: "/images/custom-nail-art-designs.jpg",
-      gallery3: "/images/french-tips-classic-elegance.jpg",
-      gallery4: "/images/nail-extensions-long-lasting.jpg",
-      gallery5: "/images/creative-nail-patterns.jpg",
-      insta1: "/images/daily-nail-art-inspiration-1.jpg",
-      insta2: "/images/client-transformation-before-after.jpg",
-      insta3: "/images/seasonal-nail-design-trends.jpg",
-      insta4: "/images/professional-nail-care-process.jpg",
-      insta5: "/images/nail-art-detail-close-up.jpg",
-      insta6: "/images/happy-client-testimonial.jpg",
-      service1: "/images/classic-manicure-service-vaxjo.jpg",
-      service2: "/images/gel-manicure-long-lasting-shine.jpg",
-      service3: "/images/custom-nail-art-design-service.jpg",
-      service4: "/images/french-manicure-timeless-elegance.jpg",
-      before1: "/images/nail-transformation-before-1.jpg",
-      after1: "/images/nail-transformation-after-1.jpg",
-      before2: "/images/nail-transformation-before-2.jpg",
-      after2: "/images/nail-transformation-after-2.jpg",
-      before3: "/images/nail-transformation-before-3.jpg",
-      after3: "/images/nail-transformation-after-3.jpg",
-      client1: "/images/satisfied-client-testimonial-1.jpg",
-      client2: "/images/happy-customer-review-2.jpg",
-      client3: "/images/client-recommendation-3.jpg",
-      social1: "/images/instagram-nail-art-post-1.jpg",
-      social2: "/images/social-media-client-feature-2.jpg",
-      social3: "/images/nail-inspiration-post-3.jpg",
-      social4: "/images/behind-scenes-salon-work.jpg",
-      social5: "/images/nail-care-tips-tutorial.jpg",
-      social6: "/images/seasonal-nail-trends.jpg",
+      // Hero images
+      hero1: "/images/professional-nail-art-showcase-vaxjo.webp",
+      hero2: "/images/manicure-process-nailsbyceline.webp",
+      hero3: "/images/modern-nail-salon-interior-vaxjo.webp",
+      hero4: "/images/satisfied-client-beautiful-nails.webp",
+
+      // Featured gallery
+      featured1: "/images/elegant-french-manicure-gold-accents.webp",
+      featured2: "/images/colorful-geometric-nail-art-design.webp",
+      featured3: "/images/acrylic-extensions-ombre-design.webp",
+
+      // Gallery grid
+      gallery1: "/images/professional-gel-manicure-vaxjo.webp",
+      gallery2: "/images/custom-nail-art-designs.webp",
+      gallery3: "/images/french-tips-classic-elegance.webp",
+      gallery4: "/images/nail-extensions-long-lasting.webp",
+      gallery5: "/images/creative-nail-patterns.webp",
+
+      // Instagram feed
+      insta1: "/images/daily-nail-art-inspiration-1.webp",
+      insta2: "/images/client-transformation-before-after.webp",
+      insta3: "/images/seasonal-nail-design-trends.webp",
+      insta4: "/images/professional-nail-care-process.webp",
+      insta5: "/images/nail-art-detail-close-up.webp",
+      insta6: "/images/happy-client-testimonial.webp",
+
+      // Services
+      service1: "/images/classic-manicure-service-vaxjo.webp",
+      service2: "/images/gel-manicure-long-lasting-shine.webp",
+      service3: "/images/custom-nail-art-design-service.webp",
+
+      // Before/After
+      before1: "/images/nail-transformation-before-1.webp",
+      after1: "/images/nail-transformation-after-1.webp",
+      before2: "/images/nail-transformation-before-2.webp",
+      after2: "/images/nail-transformation-after-2.webp",
+      before3: "/images/nail-transformation-before-3.webp",
+      after3: "/images/nail-transformation-after-3.webp",
+
+      // Testimonials
+      client1: "/images/satisfied-client-testimonial-1.webp",
+      client2: "/images/happy-customer-review-2.webp",
+      client3: "/images/client-recommendation-3.webp",
+
+      // Social media
+      social1: "/images/instagram-nail-art-post-1.webp",
+      social2: "/images/social-media-client-feature-2.webp",
+      social3: "/images/nail-inspiration-post-3.webp",
+      social4: "/images/behind-scenes-salon-work.webp",
+      social5: "/images/nail-care-tips-tutorial.webp",
+      social6: "/images/seasonal-nail-trends.webp",
     };
 
-    // Auto-assign SEO-friendly images
-    function autoAssignSEOImages() {
-      const placeholders = document.querySelectorAll(".image-placeholder[data-image-key]");
-      placeholders.forEach((placeholder) => {
-        const key = placeholder.getAttribute("data-image-key");
-        if (SEO_IMAGE_PATHS[key]) {
-          placeholder.setAttribute("data-image", SEO_IMAGE_PATHS[key]);
-        }
-      });
-    }
-
-    // Performance and SEO optimizations
+    // Initialize on DOMContentLoaded
     document.addEventListener("DOMContentLoaded", () => {
-      autoAssignSEOImages();
-      new SEOImageHandler();
+      console.log("DOM loaded, initializing image handler...");
 
-      // Preload critical resources
+      // Create single instance of image handler
+      const imageHandler = new SEOImageHandler();
+
+      // Store instance globally for debugging
+      window.seoImageHandler = imageHandler;
+
+      // Add CSS for loading states
+      if (!document.querySelector("#image-loader-styles")) {
+        const style = document.createElement("style");
+        style.id = "image-loader-styles";
+        style.textContent = `
+      @keyframes pulse {
+        0%, 100% { opacity: 1; }
+        50% { opacity: 0.8; }
+      }
+      .image-placeholder {
+        position: relative;
+        overflow: hidden;
+      }
+      .image-placeholder.loading {
+        animation: pulse 1.5s cubic-bezier(0.4, 0, 0.6, 1) infinite;
+      }
+      .image-placeholder.image-error {
+        background: linear-gradient(45deg, #fee2e2, #fecaca) !important;
+        border-color: #ef4444 !important;
+      }
+      .image-container {
+        position: absolute;
+        top: 0;
+        left: 0;
+        right: 0;
+        bottom: 0;
+        width: 100%;
+        height: 100%;
+      }
+      .image-overlay {
+        z-index: 10;
+      }
+    `;
+        document.head.appendChild(style);
+      }
+
+      // Preload critical images
       const criticalImages = [
-        "/images/professional-nail-art-showcase-vaxjo.jpg",
-        "/images/og-image.jpg"
-      ];
+        SEO_IMAGE_PATHS.hero1,
+        SEO_IMAGE_PATHS.hero2,
+        SEO_IMAGE_PATHS.featured1,
+      ].filter(Boolean);
 
       criticalImages.forEach(src => {
         const link = document.createElement("link");
         link.rel = "preload";
         link.as = "image";
         link.href = src;
+        link.onerror = () => console.log(`Failed to preload: ${src}`);
         document.head.appendChild(link);
       });
 
@@ -1164,6 +1399,21 @@
           }, 2000);
         });
       }
+
+      // Debug helper function
+      window.debugImages = () => {
+        const placeholders = document.querySelectorAll(".image-placeholder[data-image-key]");
+        console.log(`Total placeholders: ${placeholders.length}`);
+
+        placeholders.forEach((p, i) => {
+          const key = p.getAttribute("data-image-key");
+          const loaded = p.getAttribute("data-image-loaded");
+          const hasImg = p.querySelector("img.loaded");
+          console.log(`${i + 1}. ${key}: loaded=${loaded}, has img=${!!hasImg}`);
+        });
+      };
+
+      console.log("Run window.debugImages() to check image loading status");
     });
 
     // Smooth scrolling with offset for fixed header
@@ -1191,25 +1441,27 @@
     // Enhanced scroll to top with progress indicator
     const scrollToTopBtn = document.getElementById("scrollToTop");
 
-    window.addEventListener("scroll", () => {
-      const scrollTop = window.pageYOffset;
-      const docHeight = document.documentElement.scrollHeight - window.innerHeight;
-      const scrollPercent = (scrollTop / docHeight) * 100;
+    if (scrollToTopBtn) {
+      window.addEventListener("scroll", () => {
+        const scrollTop = window.pageYOffset;
+        const docHeight = document.documentElement.scrollHeight - window.innerHeight;
+        const scrollPercent = (scrollTop / docHeight) * 100;
 
-      if (scrollTop > 300) {
-        scrollToTopBtn.classList.remove("opacity-0", "invisible");
-        scrollToTopBtn.style.background = `conic-gradient(#ec4899 ${scrollPercent}%, #374151 ${scrollPercent}%)`;
-      } else {
-        scrollToTopBtn.classList.add("opacity-0", "invisible");
-      }
-    });
-
-    scrollToTopBtn.addEventListener("click", () => {
-      window.scrollTo({
-        top: 0,
-        behavior: "smooth",
+        if (scrollTop > 300) {
+          scrollToTopBtn.classList.remove("opacity-0", "invisible");
+          scrollToTopBtn.style.background = `conic-gradient(#ec4899 ${scrollPercent}%, #374151 ${scrollPercent}%)`;
+        } else {
+          scrollToTopBtn.classList.add("opacity-0", "invisible");
+        }
       });
-    });
+
+      scrollToTopBtn.addEventListener("click", () => {
+        window.scrollTo({
+          top: 0,
+          behavior: "smooth",
+        });
+      });
+    }
 
     // Intersection Observer for animations
     if ('IntersectionObserver' in window) {
@@ -1230,7 +1482,9 @@
     if ('performance' in window) {
       window.addEventListener('load', () => {
         const navigation = performance.getEntriesByType('navigation')[0];
-        console.log(`Page loaded in ${navigation.loadEventEnd - navigation.fetchStart}ms`);
+        if (navigation) {
+          console.log(`Page loaded in ${navigation.loadEventEnd - navigation.fetchStart}ms`);
+        }
       });
     }
 
